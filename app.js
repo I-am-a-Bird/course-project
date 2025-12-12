@@ -7,452 +7,356 @@ const rl = readline.createInterface({
     output: process.stdout
 });
 
-function ask(question) {
-    return new Promise((resolve) => {
-        rl.question(question, resolve);
-    });
+function ask(q) { return new Promise(r => rl.question(q, r)); }
+
+const GAME_CONFIG = Object.freeze({
+    CATEGORIES: ['города', 'животные', 'растения'],
+    DIFFICULTY_LEVELS: ['easy', 'medium', 'hard'],
+    MIN_WORD_LENGTH: 2,
+    MAX_WORDS_FOR_WIN: 5,
+    MAX_SKIPPED_TURNS: 2
+});
+
+class Validator {
+    static validateEmail(e) { return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e); }
+    static validateUsername(u) { return u && u.length >= 3 && /^[a-zA-Z0-9_]+$/.test(u); }
+    static validatePassword(p) { return p && p.length >= 4; }
+    static validateWord(w) { return w && w.trim().length >= GAME_CONFIG.MIN_WORD_LENGTH; }
 }
 
-class UserManager {
-    constructor() {
-        this.users = new Map();
-        this.userStats = new Map();
-        this.loadUsers();
+class FileManager {
+    static saveToFile(f, d) {
+        try { fs.writeFileSync(f, JSON.stringify(d, null, 2)); return {success: true}; }
+        catch(e) { return {success: false, message: e.message}; }
     }
-
-    #hashPassword(password) {
-        return crypto.createHash('sha256').update(password).digest('hex');
-    }
-
-    registerUser(username, password, email = '', role = 'user') {
-        if (this.users.has(username)) {
-            return { success: false, message: '❌ Пользователь уже существует' };
-        }
-        if (password.length < 4) {
-            return { success: false, message: '❌ Пароль минимум 4 символа' };
-        }
-        const passwordHash = this.#hashPassword(password);
-        this.users.set(username, { passwordHash, email, role, registrationDate: new Date().toISOString() });
-        this.userStats.set(username, { gamesPlayed: 0, totalScore: 0, wins: 0, bestScore: 0 });
-        this.saveUsers();
-        return { success: true, message: '✅ Регистрация успешна!' };
-    }
-
-    loginUser(username, password) {
-        const user = this.users.get(username);
-        if (!user) return { success: false, message: '❌ Пользователь не найден' };
-        if (user.passwordHash !== this.#hashPassword(password)) {
-            return { success: false, message: '❌ Неверный пароль' };
-        }
-        return { success: true, message: '✅ Авторизация успешна!', user: { username, role: user.role, email: user.email } };
-    }
-
-    updateUserStats(username, score, isWin = false) {
-        const stats = this.userStats.get(username);
-        if (stats) {
-            stats.gamesPlayed++;
-            stats.totalScore += score;
-            if (isWin) stats.wins++;
-            if (score > stats.bestScore) stats.bestScore = score;
-            this.saveUsers();
-        }
-    }
-
-    getUserStats(username) {
-        return this.userStats.get(username) || { gamesPlayed: 0, totalScore: 0, wins: 0, bestScore: 0 };
-    }
-
-    getAllUsers() {
-        return Array.from(this.users.entries()).map(([username, data]) => ({
-            username, role: data.role, email: data.email, registrationDate: data.registrationDate, stats: this.userStats.get(username)
-        }));
-    }
-
-    deleteUser(username) {
-        const deleted = this.users.delete(username);
-        this.userStats.delete(username);
-        if (deleted) this.saveUsers();
-        return deleted;
-    }
-
-    saveUsers() {
+    static loadFromFile(f) {
         try {
-            const data = { users: Array.from(this.users.entries()), userStats: Array.from(this.userStats.entries()) };
-            fs.writeFileSync('users.json', JSON.stringify(data, null, 2));
-        } catch (error) {
-            console.error('Ошибка сохранения:', error.message);
-        }
+            if (!fs.existsSync(f)) return {success: false, data: null};
+            return {success: true, data: JSON.parse(fs.readFileSync(f, 'utf8'))};
+        } catch(e) { return {success: false, data: null, message: e.message}; }
     }
-
-    loadUsers() {
-        try {
-            if (fs.existsSync('users.json')) {
-                const data = JSON.parse(fs.readFileSync('users.json', 'utf8'));
-                this.users = new Map(data.users);
-                this.userStats = new Map(data.userStats);
-                if (this.users.size === 0) {
-                    this.registerUser('admin', 'admin123', 'admin@system.com', 'admin');
-                    this.registerUser('user', 'user123', 'user@example.com', 'user');
-                }
-            } else {
-                this.registerUser('admin', 'admin123', 'admin@system.com', 'admin');
-                this.registerUser('user', 'user123', 'user@example.com', 'user');
-            }
-        } catch (error) {
-            console.error('Ошибка загрузки:', error.message);
-        }
-    }
+    static fileExists(f) { return fs.existsSync(f); }
 }
 
 class Serializable {
-    constructor() {
-        if (this.constructor === Serializable) {
-            throw new Error("Cannot instantiate abstract class");
+    constructor() { if (this.constructor === Serializable) throw new Error("Abstract class"); }
+    serialize() { throw new Error("Implement serialize"); }
+    deserialize() { throw new Error("Implement deserialize"); }
+    static deepClone(obj) { return JSON.parse(JSON.stringify(obj)); }
+}
+
+class UserManager {
+    #users = new Map(); #userStats = new Map(); static currentSession = null;
+    constructor() { this.loadUsers(); }
+    #hashPassword(p) { return crypto.createHash('sha256').update(p).digest('hex'); }
+    registerUser(u, p, e = '', r = 'user') {
+        if (this.#users.has(u)) return {success: false, message: 'User exists'};
+        if (!Validator.validateUsername(u) || !Validator.validatePassword(p)) return {success: false, message: 'Invalid data'};
+        const hash = this.#hashPassword(p);
+        this.#users.set(u, {passwordHash: hash, email: e, role: r, regDate: new Date().toISOString()});
+        this.#userStats.set(u, {gamesPlayed: 0, totalScore: 0, wins: 0, bestScore: 0, wordsUsed: [], categories: {}});
+        this.saveUsers();
+        return {success: true, message: 'Registered', user: {username: u, role: r, email: e}};
+    }
+    loginUser(u, p) {
+        const user = this.#users.get(u);
+        if (!user || user.passwordHash !== this.#hashPassword(p)) return {success: false, message: 'Invalid login'};
+        UserManager.currentSession = {username: u, role: user.role, email: user.email};
+        return {success: true, message: 'Logged in', user: UserManager.currentSession};
+    }
+    updateUserStats(u, s, win = false, word = '', cat = '') {
+        let stats = this.#userStats.get(u) || {gamesPlayed: 0, totalScore: 0, wins: 0, bestScore: 0, wordsUsed: [], categories: {}};
+        if (!stats.wordsUsed) stats.wordsUsed = [];
+        if (!stats.categories) stats.categories = {};
+        stats.gamesPlayed++; stats.totalScore += s;
+        if (win) stats.wins++; if (s > stats.bestScore) stats.bestScore = s;
+        if (word) stats.wordsUsed.push(word);
+        if (cat) stats.categories[cat] = (stats.categories[cat] || 0) + 1;
+        this.#userStats.set(u, stats); this.saveUsers();
+    }
+    getUserStats(u) {
+        const stats = this.#userStats.get(u);
+        return stats ? Object.freeze({...stats}) : {gamesPlayed: 0, totalScore: 0, wins: 0, bestScore: 0, wordsUsed: [], categories: {}};
+    }
+    getAllUsers() {
+        return Array.from(this.#users.entries()).map(([u, d]) => ({
+            username: u, role: d.role, email: d.email, registrationDate: d.regDate, stats: this.getUserStats(u)
+        }));
+    }
+    deleteUser(u) {
+        const deleted = this.#users.delete(u) && this.#userStats.delete(u);
+        if (deleted) this.saveUsers(); return deleted;
+    }
+    searchUsers(t) {
+        return this.getAllUsers().filter(u => u.username.includes(t) || u.email.includes(t));
+    }
+    saveUsers() {
+        FileManager.saveToFile('users.json', {
+            users: Array.from(this.#users.entries()),
+            userStats: Array.from(this.#userStats.entries())
+        });
+    }
+    loadUsers() {
+        const r = FileManager.loadFromFile('users.json');
+        if (r.success && r.data) {
+            this.#users = new Map(r.data.users || []);
+            this.#userStats = new Map();
+            (r.data.userStats || []).forEach(([u, s]) => {
+                this.#userStats.set(u, {
+                    gamesPlayed: s.gamesPlayed || 0, totalScore: s.totalScore || 0,
+                    wins: s.wins || 0, bestScore: s.bestScore || 0,
+                    wordsUsed: s.wordsUsed || [], categories: s.categories || {}
+                });
+            });
+        }
+        if (this.#users.size === 0) {
+            this.registerUser('admin', 'admin123', 'admin@system.com', 'admin');
+            this.registerUser('user', 'user123', 'user@example.com', 'user');
         }
     }
-    serialize() { throw new Error("Method 'serialize()' must be implemented"); }
-    deserialize(data) { throw new Error("Method 'deserialize()' must be implemented"); }
+    static isUserLoggedIn() { return UserManager.currentSession !== null; }
+    static getCurrentUser() { return UserManager.currentSession; }
+    static formatDate(d) {
+        const date = new Date(d);
+        return date.toLocaleDateString('ru-RU', {year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit'});
+    }
 }
 
 class Player extends Serializable {
     #name; #score; #id;
-    constructor(name, id = null) {
-        super();
-        this.#name = name;
-        this.#score = 0;
-        this.#id = id || Math.random().toString(36).substr(2, 9);
-    }
-    get name() { return this.#name; }
-    get score() { return this.#score; }
-    get id() { return this.#id; }
-    addPoint(points = 1) {
-        this.#score += points;
-        console.log(`${this.#name} получает ${points} очко! Текущий счет: ${this.#score}`);
-    }
+    constructor(n, id = null) { super(); this.#name = n; this.#score = 0; this.#id = id || Player.generateId(); }
+    get name() { return this.#name; } get score() { return this.#score; } get id() { return this.#id; }
+    addPoint(p = 1) { this.#score += p; console.log(`${this.#name} +${p} (${this.#score})`); }
     resetScore() { this.#score = 0; }
-    async makeMove(gameState) { throw new Error("Method 'makeMove()' must be implemented"); }
-    serialize() { return { name: this.#name, score: this.#score, id: this.#id, type: this.constructor.name }; }
-    deserialize(data) { this.#name = data.name; this.#score = data.score; this.#id = data.id; }
+    async makeMove() { throw new Error("Implement makeMove"); }
+    serialize() { return {name: this.#name, score: this.#score, id: this.#id, type: this.constructor.name}; }
+    deserialize(d) { this.#name = d.name; this.#score = d.score; this.#id = d.id; }
+    static generateId() { return Math.random().toString(36).substr(2, 9); }
+    static copyFrom(o) { const p = new this(o.name, o.id); p.#score = o.score; return p; }
 }
 
 class ComputerPlayer extends Player {
     #difficulty; #wordDatabase;
-    constructor(difficulty = 'medium') {
+    constructor(d = 'medium') {
         super("Компьютер");
-        this.#difficulty = difficulty;
+        this.#difficulty = d;
         this.#wordDatabase = {
-            'города': ['Москва', 'Амстердам', 'Мадрид', 'Лондон', 'Осло', 'Омск', 'Киев', 'Варшава', 'Афины', 'Сочи'],
+            'города': ['Москва', 'Амстердам', 'Мадрид', 'Лондон', 'Осло', 'Киев', 'Варшава', 'Рим', 'Париж', 'Берлин'],
             'животные': ['Антилопа', 'Баран', 'Носорог', 'Гепард', 'Дельфин', 'Енот', 'Жираф', 'Зебра', 'Игуана', 'Кенгуру'],
             'растения': ['Акация', 'Береза', 'Ромашка', 'Гвоздика', 'Дуб', 'Ель', 'Жасмин', 'Ирис', 'Кедр', 'Липа']
         };
     }
-    async makeMove(gameState) {
-        console.log("\n🤖 Ход компьютера...");
-        await new Promise(resolve => setTimeout(resolve, 1000));
-        const availableWords = this.#getAvailableWords(gameState.lastWord, gameState.usedWords, gameState.category);
-        if (availableWords.length === 0) {
-            console.log("❌ Компьютер не может найти подходящее слово");
-            return null;
-        }
-        const selectedWord = this.#selectWordByDifficulty(availableWords);
-        console.log(`✅ Компьютер говорит: ${selectedWord}`);
-        return selectedWord;
-    }
-    #getAvailableWords(lastWord, usedWords, category) {
-        const words = this.#wordDatabase[category] || [];
-        return words.filter(word => {
-            const lowerWord = word.toLowerCase();
-            const lowerLastWord = lastWord ? lastWord.toLowerCase() : '';
-            const isNewWord = !usedWords.has(lowerWord);
-            const isValidSequence = !lastWord || lowerWord[0] === lowerLastWord[lowerLastWord.length - 1];
-            return isNewWord && isValidSequence;
+    async makeMove(s) {
+        console.log("\nХод компьютера..."); await new Promise(r => setTimeout(r, 800));
+        const words = (this.#wordDatabase[s.category] || []).filter(w => {
+            const lw = w.toLowerCase(); const llw = s.lastWord ? s.lastWord.toLowerCase() : '';
+            return !s.usedWords.has(lw) && (!s.lastWord || lw[0] === llw[llw.length - 1]);
         });
-    }
-    #selectWordByDifficulty(words) {
-        switch (this.#difficulty) {
-            case 'easy': return words[0];
-            case 'hard': return words.reduce((longest, current) => current.length > longest.length ? current : longest, words[0]);
-            default: return words[Math.floor(Math.random() * words.length)];
+        if (words.length === 0) { console.log("Нет слов"); return null; }
+        let selected;
+        switch(this.#difficulty) {
+            case 'easy': selected = words[0]; break;
+            case 'hard': selected = words.reduce((a,b) => a.length > b.length ? a : b, words[0]); break;
+            default: selected = words[Math.floor(Math.random() * words.length)];
         }
+        console.log(`Компьютер: ${selected}`); return selected;
     }
-    serialize() { const data = super.serialize(); data.difficulty = this.#difficulty; return data; }
-    deserialize(data) { super.deserialize(data); this.#difficulty = data.difficulty || 'medium'; this.#wordDatabase = { 'города': [], 'животные': [], 'растения': [] }; }
+    serialize() { const d = super.serialize(); d.difficulty = this.#difficulty; return d; }
+    deserialize(d) { super.deserialize(d); this.#difficulty = d.difficulty || 'medium'; }
+    static initializeWordDatabase() {
+        return {
+            'города': ['Москва', 'Амстердам', 'Мадрид', 'Лондон', 'Осло', 'Киев', 'Варшава', 'Рим', 'Париж', 'Берлин'],
+            'животные': ['Антилопа', 'Баран', 'Носорог', 'Гепард', 'Дельфин', 'Енот', 'Жираф', 'Зебра', 'Игуана', 'Кенгуру'],
+            'растения': ['Акация', 'Береза', 'Ромашка', 'Гвоздика', 'Дуб', 'Ель', 'Жасмин', 'Ирис', 'Кедр', 'Липа']
+        };
+    }
 }
 
 class HumanPlayer extends Player {
     #email; #username;
-    constructor(name, email = '', username = '') { super(name); this.#email = email; this.#username = username; }
-    async makeMove(gameState) { const word = await ask(`\n🎮 ${this.name}, введите слово: `); return word.trim(); }
-    get email() { return this.#email; }
-    get username() { return this.#username; }
-    serialize() { const data = super.serialize(); data.email = this.#email; data.username = this.#username; return data; }
-    deserialize(data) { super.deserialize(data); this.#email = data.email || ''; this.#username = data.username || ''; }
+    constructor(n, e = '', u = '') { super(n); this.#email = e; this.#username = u; }
+    async makeMove() { return (await ask(`\n${this.name}, слово: `)).trim(); }
+    get email() { return this.#email; } get username() { return this.#username; }
+    updateProfile(e = '', u = '') {
+        if (e && Validator.validateEmail(e)) this.#email = e;
+        if (u && Validator.validateUsername(u)) this.#username = u;
+    }
+    serialize() { const d = super.serialize(); d.email = this.#email; d.username = this.#username; return d; }
+    deserialize(d) { super.deserialize(d); this.#email = d.email || ''; this.#username = d.username || ''; }
 }
 
 class WordGame extends Serializable {
-    #players; #usedWords; #currentCategory; #lastWord; #isGameActive; #currentUser; #userManager;
-    constructor() {
-        super();
-        this.#players = [];
-        this.#usedWords = new Set();
-        this.#currentCategory = '';
-        this.#lastWord = '';
-        this.#isGameActive = false;
-        this.#currentUser = null;
-        this.#userManager = new UserManager();
-    }
+    #players = []; #usedWords = new Set(); #currentCategory = ''; #lastWord = ''; #isGameActive = false; #currentUser = null; #userManager;
+    constructor() { super(); this.#userManager = new UserManager(); }
+    static createNewGame() { return new WordGame(); }
     async start() {
-        console.log("🎮 ДОБРО ПОЖАЛОВАТЬ В ИГРУ В СЛОВА!");
-        await this.#authMenu();
-        await this.#mainMenu();
+        console.clear(); console.log("ИГРА В СЛОВА-L\n" + "=".repeat(40));
+        await this.#authMenu(); await this.#mainMenu();
     }
     async #authMenu() {
-        while (true) {
-            console.log("\n=== СИСТЕМА АВТОРИЗАЦИИ ===");
-            console.log("1. 🔐 Войти");
-            console.log("2. 📝 Зарегистрироваться");
-            console.log("3. ❌ Выход");
-            const choice = await ask("Выберите действие: ");
-            switch (choice) {
-                case '1': if (await this.#login()) return; break;
-                case '2': await this.#register(); break;
-                case '3': console.log("👋 До свидания!"); process.exit(0);
-                default: console.log("❌ Неверный выбор");
-            }
+        while(true) {
+            console.log("\n=== АВТОРИЗАЦИЯ ===\n1. Войти\n2. Регистрация\n3. Выход");
+            const c = await ask("Выбор: ");
+            if (c === '1' && await this.#login()) break;
+            else if (c === '2') await this.#register();
+            else if (c === '3') { console.log("Выход"); rl.close(); process.exit(0); }
         }
     }
     async #login() {
-        const username = await ask("Введите логин: ");
-        const password = await ask("Введите пароль: ");
-        const result = this.#userManager.loginUser(username, password);
-        console.log(result.message);
-        if (result.success) {
-            this.#currentUser = result.user;
-            console.log(`🎯 Роль: ${this.#currentUser.role}`);
-            return true;
-        }
+        const u = await ask("Логин: "), p = await ask("Пароль: ");
+        const r = this.#userManager.loginUser(u, p); console.log(r.message);
+        if (r.success) { this.#currentUser = r.user; console.log(`${u} (${r.user.role})`); return true; }
         return false;
     }
     async #register() {
         console.log("\n=== РЕГИСТРАЦИЯ ===");
-        const username = await ask("Введите логин: ");
-        const password = await ask("Введите пароль: ");
-        const confirmPassword = await ask("Подтвердите пароль: ");
-        if (password !== confirmPassword) { console.log("❌ Пароли не совпадают"); return; }
-        const email = await ask("Введите email: ");
-        const result = this.#userManager.registerUser(username, password, email);
-        console.log(result.message);
-        if (result.success) {
-            const loginResult = this.#userManager.loginUser(username, password);
-            if (loginResult.success) this.#currentUser = loginResult.user;
-        }
+        const u = await ask("Логин: "), p = await ask("Пароль: "), cp = await ask("Повтор: ");
+        if (p !== cp) { console.log("Пароли не совпадают"); return; }
+        const e = await ask("Email: ");
+        const r = this.#userManager.registerUser(u, p, e); console.log(r.message);
+        if (r.success) this.#currentUser = this.#userManager.loginUser(u, p).user;
     }
     async #mainMenu() {
-        while (true) {
-            console.log(`\n=== ГЛАВНОЕ МЕНЮ (${this.#currentUser.username}) ===`);
-            console.log("1. 🎮 Новая игра");
-            console.log("2. 👥 Управление игроками");
-            console.log("3. 📊 Отчеты");
-            console.log("4. 👤 Управление пользователями");
-            console.log("5. 💾 Сохранить");
-            console.log("6. 📂 Загрузить");
-            console.log("7. 🔓 Сменить пользователя");
-            console.log("0. ❌ Выход");
-            const choice = await ask("Выберите действие: ");
-            switch (choice) {
-                case '1': await this.#startNewGame(); break;
-                case '2': await this.#managePlayers(); break;
-                case '3': await this.#showReports(); break;
-                case '4': await this.#manageUsers(); break;
-                case '5': await this.#saveGame(); break;
-                case '6': await this.#loadGame(); break;
-                case '7': this.#currentUser = null; await this.#authMenu(); break;
-                case '0': console.log("👋 До свидания!"); rl.close(); return;
-                default: console.log("❌ Неверный выбор");
-            }
+        while(true) {
+            console.log(`\n=== МЕНЮ (${this.#currentUser.username}) ===`);
+            console.log("1. Новая игра\n2. Игроки\n3. Отчеты\n4. Пользователи\n5. Сохранить\n6. Загрузить\n7. Сменить\n0. Выход");
+            const c = await ask("Выбор: ");
+            if (c === '1') await this.#startNewGame();
+            else if (c === '2') await this.#managePlayers();
+            else if (c === '3') await this.#showReports();
+            else if (c === '4') await this.#manageUsers();
+            else if (c === '5') await this.saveGame();
+            else if (c === '6') await this.loadGame();
+            else if (c === '7') { this.#currentUser = null; await this.#authMenu(); }
+            else if (c === '0') { console.log("Выход"); rl.close(); return; }
         }
     }
     async #manageUsers() {
-        if (!this.#currentUser || this.#currentUser.role !== 'admin') {
-            console.log("❌ Только администратор может управлять пользователями");
-            return;
-        }
-        console.log("\n=== УПРАВЛЕНИЕ ПОЛЬЗОВАТЕЛЯМИ ===");
-        console.log("1. Список пользователей");
-        console.log("2. Статистика");
-        console.log("3. Удалить пользователя");
-        const choice = await ask("Выберите действие: ");
-        switch (choice) {
-            case '1':
-                const users = this.#userManager.getAllUsers();
-                console.log("\n📋 ПОЛЬЗОВАТЕЛИ:");
-                users.forEach(user => console.log(`👤 ${user.username} (${user.role}) - ${user.email}`));
-                break;
-            case '2':
-                const allUsers = this.#userManager.getAllUsers();
-                console.log("\n📊 СТАТИСТИКА:");
-                allUsers.forEach(user => {
-                    const stats = user.stats;
-                    console.log(`👤 ${user.username}: Игр:${stats.gamesPlayed} Побед:${stats.wins} Очков:${stats.totalScore} Лучший:${stats.bestScore}`);
-                });
-                break;
-            case '3':
-                const usernameToDelete = await ask("Введите логин для удаления: ");
-                if (usernameToDelete === this.#currentUser.username) { console.log("❌ Нельзя удалить текущего пользователя"); break; }
-                if (this.#userManager.deleteUser(usernameToDelete)) console.log("✅ Пользователь удален");
-                else console.log("❌ Пользователь не найден");
-                break;
+        if (!this.#currentUser || this.#currentUser.role !== 'admin') { console.log("Только админ"); return; }
+        console.log("\n=== ПОЛЬЗОВАТЕЛИ ===\n1. Список\n2. Статистика\n3. Удалить");
+        const c = await ask("Выбор: ");
+        if (c === '1') {
+            this.#userManager.getAllUsers().forEach((u,i) => console.log(`${i+1}. ${u.username} (${u.role}) - ${u.email}`));
+        } else if (c === '2') {
+            this.#userManager.getAllUsers().forEach(u => {
+                const s = u.stats; const wr = s.gamesPlayed > 0 ? ((s.wins/s.gamesPlayed)*100).toFixed(1) : 0;
+                console.log(`${u.username}: Игр:${s.gamesPlayed} Побед:${s.wins}(${wr}%) Очков:${s.totalScore}`);
+            });
+        } else if (c === '3') {
+            const u = await ask("Удалить логин: ");
+            if (u !== this.#currentUser.username) console.log(this.#userManager.deleteUser(u) ? "Удален" : "Не найден");
+            else console.log("Нельзя удалить себя");
         }
     }
     async #startNewGame() {
         console.log("\n=== НОВАЯ ИГРА ===");
-        const categories = ['города', 'животные', 'растения'];
-        console.log("Выберите категорию:"); categories.forEach((cat, i) => console.log(`${i+1}. ${cat}`));
-        const catChoice = await ask("Ваш выбор: ");
-        this.#currentCategory = categories[parseInt(catChoice)-1] || categories[0];
-        if (this.#players.length === 0) await this.#setupPlayers();
-        else this.#players.forEach(player => player.resetScore());
-        this.#isGameActive = true;
-        this.#usedWords.clear();
-        this.#lastWord = '';
-        console.log(`\n🎯 Игра началась! Категория: ${this.#currentCategory}`);
+        console.log("Категория:"); GAME_CONFIG.CATEGORIES.forEach((c,i) => console.log(`${i+1}. ${c}`));
+        const cc = parseInt(await ask("Выбор: ")) - 1;
+        this.#currentCategory = GAME_CONFIG.CATEGORIES[cc] || GAME_CONFIG.CATEGORIES[0];
+        console.log("Сложность:"); GAME_CONFIG.DIFFICULTY_LEVELS.forEach((l,i) => console.log(`${i+1}. ${l}`));
+        const dc = parseInt(await ask("Выбор: ")) - 1;
+        const diff = ['easy','medium','hard'][dc] || 'medium';
+        if (this.#players.length === 0) {
+            const n = await ask("Ваше имя: ");
+            this.#players = [new HumanPlayer(n, this.#currentUser.email, this.#currentUser.username), new ComputerPlayer(diff)];
+        } else this.#players.forEach(p => p.resetScore());
+        this.#isGameActive = true; this.#usedWords.clear(); this.#lastWord = '';
+        console.log(`\nНачало! Категория: ${this.#currentCategory}, Сложность: ${diff}\n` + "=".repeat(30));
         await this.#gameLoop();
     }
-    async #setupPlayers() {
-        const playerName = await ask("Введите ваше имя для игры: ");
-        this.#players = [new HumanPlayer(playerName, this.#currentUser.email, this.#currentUser.username), new ComputerPlayer()];
-        console.log("✅ Игроки добавлены!");
-    }
     async #gameLoop() {
-        let currentPlayerIndex = 0;
-        let skippedTurns = 0;
-        while (this.#isGameActive && skippedTurns < 2) {
-            const player = this.#players[currentPlayerIndex];
-            console.log(`\n--- Ход ${player.name} ---`);
-            const word = await player.makeMove({ lastWord: this.#lastWord, usedWords: this.#usedWords, category: this.#currentCategory });
-            if (word && this.#validateWord(word, this.#lastWord, this.#usedWords)) {
-                console.log(`✅ Правильное слово!`);
-                this.#usedWords.add(word.toLowerCase());
-                this.#lastWord = word;
-                player.addPoint();
-                skippedTurns = 0;
+        let playerIdx = 0, skipped = 0, round = 1;
+        while (this.#isGameActive && skipped < GAME_CONFIG.MAX_SKIPPED_TURNS) {
+            console.log(`\nРаунд ${round}\n` + "-".repeat(20));
+            const player = this.#players[playerIdx];
+            console.log(`Ход: ${player.name}`);
+            const word = await player.makeMove({
+                lastWord: this.#lastWord,
+                usedWords: this.#usedWords,
+                category: this.#currentCategory
+            });
+            if (word && this.#validateWord(word)) {
+                console.log(`Правильно: "${word}"`);
+                const lw = word.toLowerCase();
+                this.#usedWords.add(lw); this.#lastWord = word;
+                player.addPoint(Math.min(Math.floor(word.length/2), 3));
+                skipped = 0; round++;
+                if (this.#usedWords.size >= GAME_CONFIG.MAX_WORDS_FOR_WIN) {
+                    this.#isGameActive = false; console.log("\nИгра окончена!");
+                    this.#showWinner(); this.#updateStats(); return;
+                }
             } else {
-                console.log(`❌ Неправильное слово!`);
-                skippedTurns++;
-            }
-            console.log("\n📊 Текущий счет:");
-            this.#players.forEach(p => console.log(`  ${p.name}: ${p.score} очков`));
-            currentPlayerIndex = (currentPlayerIndex + 1) % this.#players.length;
-            if (this.#usedWords.size >= 5) {
-                this.#isGameActive = false;
-                console.log("\n🎯 Игра завершена!");
-                this.#showWinner();
-                const humanPlayer = this.#players.find(p => p instanceof HumanPlayer);
-                if (humanPlayer && humanPlayer.username) {
-                    const isWin = humanPlayer.score > this.#players[1].score;
-                    this.#userManager.updateUserStats(humanPlayer.username, humanPlayer.score, isWin);
+                console.log(`"${word || '(пусто)'}" не подходит`);
+                if (++skipped >= GAME_CONFIG.MAX_SKIPPED_TURNS) {
+                    console.log("\nСлишком много ошибок!"); this.#showWinner(); this.#updateStats(); return;
                 }
             }
-        }
-        if (skippedTurns >= 2) {
-            console.log("\n💀 Игра завершена - слишком много неправильных ходов!");
-            this.#showWinner();
+            console.log(`\nСлов: ${this.#usedWords.size}/${GAME_CONFIG.MAX_WORDS_FOR_WIN}, Последнее: ${this.#lastWord || '-'}`);
+            this.#players.forEach(p => console.log(`   ${p.name}: ${p.score}`));
+            playerIdx = (playerIdx + 1) % this.#players.length;
+            if (player instanceof ComputerPlayer) await new Promise(r => setTimeout(r, 600));
         }
     }
-    #validateWord(word, lastWord, usedWords) {
-        if (!word || word.length < 2) return false;
-        const lowerWord = word.toLowerCase();
-        const lowerLastWord = lastWord ? lastWord.toLowerCase() : '';
-        const isNewWord = !usedWords.has(lowerWord);
-        const isValidSequence = !lastWord || lowerWord[0] === lowerLastWord[lowerLastWord.length - 1];
-        return isNewWord && isValidSequence;
+    #validateWord(w) {
+        if (!Validator.validateWord(w)) { console.log(`Минимум ${GAME_CONFIG.MIN_WORD_LENGTH} буквы`); return false; }
+        const lw = w.toLowerCase(); const llw = this.#lastWord ? this.#lastWord.toLowerCase() : '';
+        if (this.#usedWords.has(lw)) { console.log("Уже было"); return false; }
+        if (this.#lastWord && lw[0] !== llw[llw.length-1]) { console.log(`Начинается на "${llw[llw.length-1]}"`); return false; }
+        return true;
     }
     #showWinner() {
-        const winner = this.#players.reduce((a, b) => a.score > b.score ? a : b);
-        console.log(`🏆 ПОБЕДИТЕЛЬ: ${winner.name} с ${winner.score} очками!`);
-        if (this.#currentUser) {
-            const stats = this.#userManager.getUserStats(this.#currentUser.username);
-            console.log(`\n📈 Ваша статистика: Игр:${stats.gamesPlayed} Побед:${stats.wins} Лучший:${stats.bestScore}`);
+        const w = this.#players.reduce((a,b) => a.score > b.score ? a : b);
+        console.log("\n" + "=".repeat(40) + `\nПОБЕДИТЕЛЬ: ${w.name} (${w.score} очков)\n` + "=".repeat(40));
+        this.#players.forEach((p,i) => console.log(`${i+1}. ${p.name}: ${p.score}`));
+    }
+    #updateStats() {
+        const hp = this.#players.find(p => p instanceof HumanPlayer);
+        if (hp && hp.username) {
+            const cp = this.#players.find(p => p instanceof ComputerPlayer);
+            this.#userManager.updateUserStats(hp.username, hp.score, cp ? hp.score > cp.score : true, this.#lastWord, this.#currentCategory);
         }
     }
     async #managePlayers() {
-        console.log("\n=== УПРАВЛЕНИЕ ИГРОКАМИ ===");
-        console.log("1. Добавить игрока");
-        console.log("2. Удалить игрока");
-        console.log("3. Список игроков");
-        const choice = await ask("Выберите действие: ");
-        switch (choice) {
-            case '1':
-                const name = await ask("Введите имя: ");
-                const email = await ask("Введите email: ");
-                this.#players.push(new HumanPlayer(name, email));
-                console.log("✅ Игрок добавлен!");
-                break;
-            case '2':
-                if (this.#players.length > 0) {
-                    this.#players.forEach((p, i) => console.log(`${i+1}. ${p.name}`));
-                    const index = parseInt(await ask("Введите номер: ")) - 1;
-                    if (this.#players[index]) {
-                        const removed = this.#players.splice(index, 1)[0];
-                        console.log(`✅ Игрок ${removed.name} удален`);
-                    }
-                }
-                break;
-            case '3':
-                this.#players.forEach(p => console.log(`  ${p.name} - ${p.score} очков`));
-                break;
+        console.log("\n=== ИГРОКИ ===\n1. Добавить\n2. Удалить\n3. Список");
+        const c = await ask("Выбор: ");
+        if (c === '1') {
+            const n = await ask("Имя: "), e = await ask("Email: ");
+            if (n.trim()) { this.#players.push(new HumanPlayer(n.trim(), e)); console.log("Добавлен"); }
+        } else if (c === '2' && this.#players.length > 0) {
+            this.#players.forEach((p,i) => console.log(`${i+1}. ${p.name}`));
+            const idx = parseInt(await ask("Номер: ")) - 1;
+            if (idx >= 0 && idx < this.#players.length) console.log(`Удален: ${this.#players.splice(idx,1)[0].name}`);
+        } else if (c === '3') {
+            this.#players.forEach((p,i) => console.log(`${i+1}. ${p.name} - ${p.score}`));
         }
     }
     async #showReports() {
-        console.log("\n=== ОТЧЕТЫ ===");
-        console.log("1. Статистика игры");
-        console.log("2. Анализ слов");
-        console.log("3. Статистика пользователя");
-        const choice = await ask("Выберите отчет: ");
-        switch (choice) {
-            case '1':
-                const stats = this.#generateGameStatsReport();
-                console.log("\n📈 СТАТИСТИКА ИГРЫ:");
-                console.log(`Игроков: ${stats.totalPlayers} Слов: ${stats.totalWordsUsed} Категория: ${stats.currentCategory} Лучший: ${stats.topPlayer.name} (${stats.topPlayer.score})`);
-                break;
-            case '2':
-                const analysis = this.#generateWordAnalysisReport();
-                console.log("\n📊 АНАЛИЗ СЛОВ:");
-                console.log(`Всего: ${analysis.totalWords} Средняя длина: ${analysis.averageWordLength.toFixed(2)}`);
-                console.log(`Самое длинное: ${analysis.longestWord} Самое короткое: ${analysis.shortestWord}`);
-                break;
-            case '3':
-                if (this.#currentUser) {
-                    const userStats = this.#userManager.getUserStats(this.#currentUser.username);
-                    console.log("\n👤 СТАТИСТИКА:");
-                    console.log(`Игр:${userStats.gamesPlayed} Побед:${userStats.wins} Очков:${userStats.totalScore} Лучший:${userStats.bestScore}`);
-                }
-                break;
+        console.log("\n=== ОТЧЕТЫ ===\n1. Статистика игры\n2. Анализ слов\n3. Статистика пользователя");
+        const c = await ask("Выбор: ");
+        if (c === '1') {
+            const tp = this.#players.length > 0 ? this.#players.reduce((a,b) => a.score > b.score ? a : b, this.#players[0]) : {name:'нет',score:0};
+            console.log(`Игроков: ${this.#players.length}, Слов: ${this.#usedWords.size}, Категория: ${this.#currentCategory}, Лучший: ${tp.name} (${tp.score})`);
+        } else if (c === '2' && this.#usedWords.size > 0) {
+            const words = Array.from(this.#usedWords);
+            const l = words.reduce((a,b) => a.length > b.length ? a : b, words[0]);
+            const s = words.reduce((a,b) => a.length < b.length ? a : b, words[0]);
+            console.log(`Всего: ${words.length}, Ср.длина: ${(words.reduce((sum,w) => sum + w.length,0)/words.length).toFixed(2)}`);
+            console.log(`Самое длинное: "${l}" (${l.length}), Самое короткое: "${s}" (${s.length})`);
+        } else if (c === '3' && this.#currentUser) {
+            const s = this.#userManager.getUserStats(this.#currentUser.username);
+            console.log(`Игр:${s.gamesPlayed} Побед:${s.wins} Очков:${s.totalScore} Лучший:${s.bestScore}`);
         }
     }
-    #generateGameStatsReport() {
-        const topPlayer = this.#players.length > 0 ? this.#players.reduce((a, b) => a.score > b.score ? a : b, this.#players[0]) : { name: 'нет', score: 0 };
-        return { totalPlayers: this.#players.length, totalWordsUsed: this.#usedWords.size, currentCategory: this.#currentCategory, topPlayer: topPlayer };
+    async saveGame() {
+        const f = await ask("Файл (game_save.json): ") || 'game_save.json';
+        const r = FileManager.saveToFile(f, this.serialize());
+        console.log(r.success ? `Сохранено: ${f}` : `Ошибка: ${r.message}`);
     }
-    #generateWordAnalysisReport() {
-        const words = Array.from(this.#usedWords);
-        if (words.length === 0) return { totalWords: 0, averageWordLength: 0, longestWord: 'нет', shortestWord: 'нет' };
-        const longest = words.reduce((a, b) => a.length > b.length ? a : b, words[0]);
-        const shortest = words.reduce((a, b) => a.length < b.length ? a : b, words[0]);
-        return { totalWords: words.length, averageWordLength: words.reduce((sum, word) => sum + word.length, 0) / words.length, longestWord: longest, shortestWord: shortest };
-    }
-    async #saveGame() {
-        const filename = await ask("Имя файла: ") || 'game_save.json';
-        try { fs.writeFileSync(filename, JSON.stringify(this.serialize(), null, 2)); console.log(`✅ Сохранено: ${filename}`); }
-        catch (error) { console.error('❌ Ошибка:', error.message); }
-    }
-    async #loadGame() {
-        const filename = await ask("Имя файла: ") || 'game_save.json';
-        try {
-            if (!fs.existsSync(filename)) { console.log('❌ Файл не найден'); return; }
-            this.deserialize(JSON.parse(fs.readFileSync(filename, 'utf8')));
-            console.log('✅ Загружено');
-        } catch (error) { console.error('❌ Ошибка:', error.message); }
+    async loadGame() {
+        const f = await ask("Файл (game_save.json): ") || 'game_save.json';
+        const r = FileManager.loadFromFile(f);
+        if (r.success) { this.deserialize(r.data); console.log(`Загружено: ${f}`); }
+        else console.log("Файл не найден");
     }
     serialize() {
         return {
@@ -479,8 +383,13 @@ class WordGame extends Serializable {
 }
 
 async function main() {
-    try { const game = new WordGame(); await game.start(); }
-    catch (error) { console.error('❌ Ошибка:', error.message); process.exit(1); }
+    try {
+        const game = WordGame.createNewGame();
+        await game.start();
+    } catch(e) {
+        console.error('Ошибка:', e.message);
+        process.exit(1);
+    }
 }
 
-main();
+if (require.main === module) main();
